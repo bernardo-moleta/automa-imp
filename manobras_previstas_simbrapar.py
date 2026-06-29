@@ -2,6 +2,10 @@
 import pandas as pd
 import requests
 from io import StringIO
+from datetime import datetime
+
+#configs
+data_de_extracao = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
 # 1. Definir a URL da tabela
 url = 'http://sinprapar.com.br/PREV.HTM'
@@ -31,7 +35,7 @@ try:
         df = df.dropna(how='all', axis=1).dropna(how='all', axis=0)
         
         # 4. Salvar os dados em um arquivo Excel
-        nome_arquivo = 'Manobras_SINPRAPAR.xlsx'
+        nome_arquivo = f'manobras_previstas_simbrapar{data_de_extracao}.xlsx'
         df.to_excel(nome_arquivo, index=False, engine='openpyxl')
         
         print(f"Sucesso! Extraídos {len(df)} registros.")
