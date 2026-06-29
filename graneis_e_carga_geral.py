@@ -82,3 +82,4 @@ if __name__ == "__main__":
     extrair_relatorios_recentes()
     
 #TODO: Salvar os arquivos no caminho específico
+#TODO: Transformar os arquivos PDF em Excel
