@@ -1,48 +1,201 @@
 import pandas as pd
+import warnings
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 
-def comparar_escalacao_siacesp(caminho_lineup, caminho_siacesp):
-    # 1. Preparação dos dados: Carregamento das bases
-    try:
-        df_lineup = pd.read_excel(caminho_lineup)
-        df_siacesp = pd.read_excel(caminho_siacesp)
-    except FileNotFoundError as e:
-        return f"Erro ao carregar arquivos: {e}"
+# Ignora avisos de tipos mistos que podem aparecer ao ler arquivos CSV grandes
+warnings.filterwarnings('ignore')
 
-    # Sanitização básica de colunas para garantir referências exatas
-    df_lineup.columns = df_lineup.columns.str.strip()
-    df_siacesp.columns = df_siacesp.columns.str.strip()
+class ComparadorEscalacao:
+    def __init__(self, siacesp_path, data_posicao_alvo, mes_etb_alvo):
+        """
+        Inicializa a classe centralizando a base do SIACESP.
+        """
+        self.df_siacesp = pd.read_csv(siacesp_path, low_memory=False)
+        self.data_posicao_alvo = pd.to_datetime(data_posicao_alvo).date()
+        self.mes_etb_alvo = mes_etb_alvo
+        
+        # Converte o volume para numérico (substituindo erros por 0) e agrega a base
+        self.df_siacesp['VOLUME'] = pd.to_numeric(self.df_siacesp['VOLUME'], errors='coerce').fillna(0)
+        self.siacesp_agg = self.df_siacesp.groupby('Y_PRODUTO PARA', as_index=False)['VOLUME'].sum()
+        self.siacesp_agg.rename(columns={'VOLUME': 'Volume_SIACESP'}, inplace=True)
+        
+    def processar_lineup(self, nome, caminho, col_data_pos, col_etb, col_volume):
+        """
+        Lê, limpa, filtra e compara um arquivo individual de Escalação (Line Up).
+        """
+        df = pd.read_csv(caminho, low_memory=False)
+        
+        # Tratamento das colunas de data
+        df[col_data_pos] = pd.to_datetime(df[col_data_pos], errors='coerce')
+        # format='mixed' e dayfirst=False ajudam com padrões irregulares como MM/DD/YYYY
+        df[col_etb] = pd.to_datetime(df[col_etb], errors='coerce', format='mixed', dayfirst=False) 
+        
+        # Aplica o filtro de Data da Posição e Mês do ETB
+        df_filtrado = df[df[col_data_pos].dt.date == self.data_posicao_alvo]
+        df_mes = df_filtrado[df_filtrado[col_etb].dt.month == self.mes_etb_alvo]
+        
+        # Converte a coluna de volume customizada e agrega os dados
+        df_mes[col_volume] = pd.to_numeric(df_mes[col_volume], errors='coerce').fillna(0)
+        lineup_agg = df_mes.groupby('Y_PRODUTO PARA', as_index=False)[col_volume].sum()
+        lineup_agg.rename(columns={col_volume: 'Volume_LineUp'}, inplace=True)
+        
+        # Realiza um outer merge para garantir que produtos exclusivos de uma base também apareçam
+        comparacao = pd.merge(lineup_agg, self.siacesp_agg, on='Y_PRODUTO PARA', how='outer').fillna(0)
+        
+        # Calcula a discrepância
+        comparacao['Discrepancia'] = comparacao['Volume_LineUp'] - comparacao['Volume_SIACESP']
+        
+        # Organiza as maiores discrepâncias no topo e adiciona a identificação da origem
+        comparacao = comparacao.sort_values(by='Discrepancia', key=abs, ascending=False).reset_index(drop=True)
+        comparacao.insert(0, 'Fonte Line Up', nome)
+        
+        # Arredonda os valores decimais para manter o relatório limpo
+        comparacao['Volume_LineUp'] = comparacao['Volume_LineUp'].round(2)
+        comparacao['Volume_SIACESP'] = comparacao['Volume_SIACESP'].round(2)
+        comparacao['Discrepancia'] = comparacao['Discrepancia'].round(2)
+        
+        return comparacao
 
-    # Conversão de colunas de data do Line Up para datetime
-    df_lineup['DATA POSIÇÃO'] = pd.to_datetime(df_lineup['DATA POSIÇÃO'], errors='coerce')
-    df_lineup['ETB'] = pd.to_datetime(df_lineup['ETB'], errors='coerce')
 
-    # 2. Filtragem: Selecionar linhas onde a data da posição é 11 de junho de 2026
-    data_alvo = pd.to_datetime('2026-06-11').date()
-    df_lineup_filtrado = df_lineup[df_lineup['DATA POSIÇÃO'].dt.date == data_alvo]
-
-    # 3. Agregação (Lista de Produtos): Isolar mês de maio pela coluna ETB
-    df_lineup_maio = df_lineup_filtrado[df_lineup_filtrado['ETB'].dt.month == 5]
+def aplicar_estilo_planilha(ws, titulo):
+    """
+    Formata as células do Excel com padrão visual (cores corporativas e zebrado).
+    """
+    header_fill = PatternFill(start_color="2c3e50", end_color="2c3e50", fill_type="solid")
+    header_font = Font(name="Arial", size=11, bold=True, color="ffffff")
+    zebra_fill = PatternFill(start_color="f2f4f5", end_color="f2f4f5", fill_type="solid")
+    white_fill = PatternFill(start_color="ffffff", end_color="ffffff", fill_type="solid")
+    thin_border = Border(left=Side(style='thin', color="d3d3d3"),
+                         right=Side(style='thin', color="d3d3d3"),
+                         top=Side(style='thin', color="d3d3d3"),
+                         bottom=Side(style='thin', color="d3d3d3"))
+                         
+    # Insere e pinta o título superior
+    ws.insert_rows(1, 2)
+    ws['A1'] = titulo
+    ws['A1'].font = Font(name="Arial", size=14, bold=True, color="2c3e50")
     
-    # Agrupar dados por Produto ('Y_PRODUTO PARA') e somar as quantidades ('Qtty')
-    lineup_agg = df_lineup_maio.groupby('Y_PRODUTO PARA', as_index=False)['Qtty'].sum()
-    lineup_agg.rename(columns={'Qtty': 'Volume_LineUp'}, inplace=True)
+    # Itera sobre todas as colunas para aplicar estilos e auto-ajustar larguras
+    for col_idx, col in enumerate(ws.iter_cols(min_row=3, max_row=ws.max_row, min_col=1, max_col=ws.max_column)):
+        max_length = 0
+        for row_idx, cell in enumerate(col):
+            if row_idx == 0:  # Linha de Cabeçalho
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:             # Dados
+                cell.fill = zebra_fill if row_idx % 2 == 0 else white_fill
+                cell.font = Font(name="Arial", size=10)
+                
+                # Alinha números à direita e textos à esquerda
+                if isinstance(cell.value, (int, float)):
+                    cell.alignment = Alignment(horizontal="right")
+                    cell.number_format = '#,##0.00'
+                else:
+                    cell.alignment = Alignment(horizontal="left")
+                    
+            cell.border = thin_border
+            
+            # Checa o tamanho para ajuste da coluna
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+                
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[col[0].column_letter].width = adjusted_width if adjusted_width > 12 else 12
+        
+    ws.freeze_panes = 'A4' # Congela as linhas de cabeçalho e título ao rolar para baixo
 
-    # 4. Agregação (SIACESP): Agrupar por produto e somar o Volume
-    siacesp_agg = df_siacesp.groupby('Y_PRODUTO PARA', as_index=False)['VOLUME'].sum()
-    siacesp_agg.rename(columns={'VOLUME': 'Volume_SIACESP'}, inplace=True)
 
-    # 5. Comparação: Unir os dois dataframes agregados e substituir valores faltantes por 0
-    df_comparacao = pd.merge(lineup_agg, siacesp_agg, on='Y_PRODUTO PARA', how='outer').fillna(0)
+def main():
+    # 1. Instanciar a classe base configurando Data da Posição (2026-06-11) e Mês ETB (Maio)
+    # NOTA: Ajuste o nome dos arquivos nos parâmetros conforme estão salvos localmente
+    comparador = ComparadorEscalacao('BI_Importacao Siacesp.xlsx - BASE_IMP.csv', '2026-06-11', 5)
 
-    # Calcular as discrepâncias entre as bases
-    df_comparacao['Discrepancia'] = df_comparacao['Volume_LineUp'] - df_comparacao['Volume_SIACESP']
+    # 2. Processar cada base com suas colunas de volume específicas
+    comp_futuro = comparador.processar_lineup(
+        nome='FUTURO', 
+        caminho='BI_Line Up.xlsx - FUTURO_posicao semanal.csv', 
+        col_data_pos='DATA_POSIÇÃO', 
+        col_etb='ETB', 
+        col_volume='TONNAGE'
+    )
+    
+    comp_trans = comparador.processar_lineup(
+        nome='TRANSATLANTICA', 
+        caminho='BI_Line Up_TRANSATLANTICA.xlsx - LineUp_Transatlantica.csv', 
+        col_data_pos='DATA POSIÇÃO', 
+        col_etb='ETB', 
+        col_volume='QUANTITY'
+    )
+    
+    comp_wilson = comparador.processar_lineup(
+        nome='WILSON SONS', 
+        caminho='BI_Line Up_WILSON SONS.xlsx - Plan1.csv', 
+        col_data_pos='DATA POSIÇÃO', 
+        col_etb='ETB', 
+        col_volume='WEIGHT'
+    )
+    
+    comp_orion = comparador.processar_lineup(
+        nome='Sheet1', 
+        caminho='BI_Line Up_ORION.xlsx - Plan1.csv', 
+        col_data_pos='DATA POSIÇÃO',
+        col_etb='Z_ETB', 
+        col_volume='Qtty'
+    )
 
-    # Organizar o resultado pelas maiores diferenças (em valores absolutos) para facilitar a análise
-    df_resultado = df_comparacao.sort_values(by='Discrepancia', key=abs, ascending=False).reset_index(drop=True)
+    # 3. Concatenar as bases e extrair as Top 20 maiores divergências num contexto consolidado
+    resumo = pd.concat([comp_futuro, comp_trans, comp_wilson, comp_orion])
+    resumo = resumo[resumo['Discrepancia'] != 0].sort_values(by='Discrepancia', key=abs, ascending=False).head(20)
 
-    return df_resultado
+    # 4. Construção do Arquivo Excel usando OpenPyXL
+    wb = Workbook()
 
-# Execução da função
+    # Aba 1: Resumo Global
+    ws_summary = wb.active
+    ws_summary.title = "Resumo Consolidado"
+    for r in dataframe_to_rows(resumo, index=False, header=True):
+        ws_summary.append(r)
+    aplicar_estilo_planilha(ws_summary, "Top 20 Discrepâncias - Múltiplas Fontes (Maio 2026)")
+
+    # Aba 2: Futuro
+    ws_futuro = wb.create_sheet(title="Comp_FUTURO")
+    for r in dataframe_to_rows(comp_futuro, index=False, header=True):
+        ws_futuro.append(r)
+    aplicar_estilo_planilha(ws_futuro, "Comparação: Line Up FUTURO vs SIACESP")
+
+    # Aba 3: Transatlântica
+    ws_trans = wb.create_sheet(title="Comp_TRANSATLANTICA")
+    for r in dataframe_to_rows(comp_trans, index=False, header=True):
+        ws_trans.append(r)
+    aplicar_estilo_planilha(ws_trans, "Comparação: Line Up TRANSATLANTICA vs SIACESP")
+
+    # Aba 4: Wilson Sons
+    ws_wilson = wb.create_sheet(title="Comp_WILSON_SONS")
+    for r in dataframe_to_rows(comp_wilson, index=False, header=True):
+        ws_wilson.append(r)
+    aplicar_estilo_planilha(ws_wilson, "Comparação: Line Up WILSON SONS vs SIACESP")
+    
+    ws_orion = wb.create_sheet(title="Comp_ORION")
+    for r in dataframe_to_rows(comp_orion, index=False, header=True):
+        ws_orion.append(r)
+    aplicar_estilo_planilha(ws_orion, "Comparação: Line Up ORION vs SIACESP")
+
+    # Aba 5: Base de Segurança SIACESP (apenas os volumes agrupados originais)
+    ws_siacesp = wb.create_sheet(title="Base_SIACESP_Agregada")
+    for r in dataframe_to_rows(comparador.siacesp_agg.sort_values(by='Volume_SIACESP', ascending=False), index=False, header=True):
+        ws_siacesp.append(r)
+    aplicar_estilo_planilha(ws_siacesp, "SIACESP - Volume Total por Produto")
+
+    # 5. Salva o resultado final
+    wb.save("Analise_Comparativa_Escalacao.xlsx")
+    print("Relatório 'Analise_Comparativa_Escalacao.xlsx' gerado com sucesso!")
+
+# Executa o pipeline
 if __name__ == "__main__":
-    resultado_final = comparar_escalacao_siacesp('BI_Line Up_ORION.xlsx', 'siacesp.xlsx')
-    print(resultado_final.to_string())
+    main()
